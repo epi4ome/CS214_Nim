@@ -3,18 +3,15 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/select.h> 
 #include <netdb.h>
 #include <signal.h>
-#include <sys/time.h>
-#include <sys/select.h>
-#include <ctype.h>
-#include <errno.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <limits.h>
 
 #define QUEUE 10
 #define MAX_MSG_BYTES 104
@@ -61,9 +58,14 @@ int client_cap = 0;
 game_t **games = NULL;
 int game_count = 0;
 int game_cap = 0;
-int next_game_id = 1;
+int next_gid = 1;
 
 pthread_mutex_t global_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int act_client_thrds = 0;
+int act_game_thrds = 0;
+pthread_mutex_t active_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t active_cond = PTHREAD_COND_INITIALIZER;
 
 static void nim_logf(const char *fmt, ...) {
     va_list ap;
@@ -132,13 +134,8 @@ void install_handlers(void) {
     sigaddset(&act.sa_mask, SIGTERM);
     sigaction(SIGINT, &act, NULL);
     sigaction(SIGTERM, &act, NULL);
-    /* avoid process termination when writing to closed sockets */
     signal(SIGPIPE, SIG_IGN);
 }
-
-/* removed unused remove_act() - list management uses add_client/remove_client */
-
-/*parser and message builders*/
 
 static msg_type_t decode_type(const char *t) {
     if (!strncmp(t, "OPEN", 4)) return MSG_OPEN;
@@ -188,7 +185,7 @@ static void send_fail(int fd, int code, const char *msg) {
     char payload[256];
     int n = snprintf(payload, sizeof(payload), "FAIL|%d %s|", code, msg);
     if (n < 0) return;
-    if (n > MAX_MSG_BYTES) return; /* don't attempt to send oversized protocol payload */
+    if (n > MAX_MSG_BYTES) return; 
     send_ngp(fd, payload);
 }
 
@@ -233,7 +230,7 @@ static void free_message(message_t *msg) {
     msg->field_count = 0;
 }
 
-static int read_ngp_message(int fd, message_t *out) {
+static int read_message(int fd, message_t *out) {
     out->field_count = 0;
     out->fields = NULL;
     out->type = MSG_INVALID;
@@ -249,18 +246,16 @@ static int read_ngp_message(int fd, message_t *out) {
         }
         got += (size_t)r;
     }
-    
-    if (!isdigit((unsigned char)header[0]) || header[1] != '|' || 
-        !isdigit((unsigned char)header[2]) || !isdigit((unsigned char)header[3]) || 
-        header[4] != '|') {
-        return 10;
-    }
-    
-    if (header[0] != '0') {
+
+    if (header[1] != '|' || header[4] != '|' || 
+        header[0] != '0' ||
+        !isdigit((unsigned char)header[2]) || 
+        !isdigit((unsigned char)header[3])) {
         return 10;
     }
     
     int stated_len = (header[2] - '0') * 10 + (header[3] - '0');
+    
     if (stated_len < 1 || stated_len > MAX_MSG_BYTES) {
         return 10;
     }
@@ -284,6 +279,7 @@ static int read_ngp_message(int fd, message_t *out) {
         free(payload);
         return 10;
     }
+    payload[stated_len] = '\0'; 
 
     char *save = strdup(payload);
     free(payload);
@@ -324,17 +320,12 @@ static int read_ngp_message(int fd, message_t *out) {
             out->fields[i] = strdup(tokens[i + 1]);
         }
     }
-    else {
-        out->fields = NULL;
-    }
     
     free(save);
     return 0;
 }
 
-
-
-static int validate_name_field(const char *name) {
+static int name_valid(const char *name) {
     if (!name) return 10;
     size_t len = strlen(name);
     if (len == 0) return 10;
@@ -347,7 +338,7 @@ static int validate_name_field(const char *name) {
     return 0;
 }
 
-int is_name_in_use(const char *name) {
+int name_use(const char *name) {
     pthread_mutex_lock(&global_mutex);
     for (int i = 0; i < client_count; i++) {
         if (clients[i]->is_playing && strcmp(clients[i]->name, name) == 0) {
@@ -452,7 +443,6 @@ void *game_thread(void *arg) {
     game->current_turn = 1;
     
     while (active && !game->game_over) {
-        /* read current turn under lock to avoid races */
         int cur_turn;
         pthread_mutex_lock(&game->lock);
         cur_turn = game->current_turn;
@@ -464,7 +454,6 @@ void *game_thread(void *arg) {
         send_play(current_player->sock, cur_turn, game->board);
         send_play(other_player->sock, cur_turn, game->board);
 
-        /* wait for input on either socket so we can detect impatient MOVE from other player */
         fd_set rfds;
         FD_ZERO(&rfds);
         int maxfd = -1;
@@ -472,7 +461,6 @@ void *game_thread(void *arg) {
         if (other_player->sock >= 0) { FD_SET(other_player->sock, &rfds); if (other_player->sock > maxfd) maxfd = other_player->sock; }
 
         if (maxfd < 0) {
-            /* both sockets closed? end game */
             pthread_mutex_lock(&game->lock);
             game->game_over = 1;
             game->winner = 0;
@@ -487,12 +475,10 @@ void *game_thread(void *arg) {
             break;
         }
 
-        /* if other player sent something out-of-turn, handle it */
         if (other_player->sock >= 0 && FD_ISSET(other_player->sock, &rfds)) {
             message_t imsg;
-            int r = read_ngp_message(other_player->sock, &imsg);
+            int r = read_message(other_player->sock, &imsg);
             if (r < 0) {
-                /* other disconnected -> current player wins by forfeit */
                 if (other_player->sock >= 0) { close(other_player->sock); other_player->sock = -1; }
                 pthread_mutex_lock(&game->lock);
                 game->game_over = 1;
@@ -513,12 +499,10 @@ void *game_thread(void *arg) {
             }
 
             if (imsg.type == MSG_MOVE) {
-                /* impatient move: immediate FAIL 31, keep connection open */
                 send_fail(other_player->sock, 31, "Impatient");
                 free_message(&imsg);
-                continue; /* continue waiting for current player's move */
+                continue; 
             } else {
-                /* other message types are protocol errors during game */
                 send_fail(other_player->sock, 10, "Invalid");
                 if (other_player->sock >= 0) { close(other_player->sock); other_player->sock = -1; }
                 pthread_mutex_lock(&game->lock);
@@ -531,10 +515,9 @@ void *game_thread(void *arg) {
             }
         }
 
-        /* if current player's socket is readable, handle the move */
         if (current_player->sock >= 0 && FD_ISSET(current_player->sock, &rfds)) {
             message_t msg;
-            int read_result = read_ngp_message(current_player->sock, &msg);
+            int read_result = read_message(current_player->sock, &msg);
 
             if (read_result < 0) {
                 nim_logf("Game %d: Player %d disconnected", game->id, cur_turn);
@@ -569,7 +552,6 @@ void *game_thread(void *arg) {
                 break;
             }
 
-            /* handle MOVE as before */
             if (msg.field_count != 2) {
                 send_fail(current_player->sock, 10, "Invalid");
                 if (current_player->sock >= 0) { close(current_player->sock); current_player->sock = -1; }
@@ -646,15 +628,17 @@ void *game_thread(void *arg) {
     free(p2);
     free(game);
     
+    pthread_mutex_lock(&active_mutex);
+    act_game_thrds--;
+    pthread_cond_signal(&active_cond);
+    pthread_mutex_unlock(&active_mutex);
     return NULL;
 }
 
 void add_wait(client_t *c) {
-    /* add client to global list */
     add_client(c);
     pthread_mutex_lock(&global_mutex);
 
-    // Check if we can match this player with a waiting opponent
     client_t *opponent = NULL;
     for (int i = 0; i < client_count; i++) {
         if (clients[i] != c && clients[i]->is_waiting && !clients[i]->is_playing) {
@@ -665,7 +649,6 @@ void add_wait(client_t *c) {
     }
 
     if (opponent) {
-        // Found opponent, start a game
         c->is_waiting = 0;
         c->is_playing = 1;
         opponent->is_playing = 1;
@@ -685,7 +668,7 @@ void add_wait(client_t *c) {
             return;
         }
 
-        game->id = next_game_id++;
+        game->id = next_gid++;
         game->player1 = c;
         game->player2 = opponent;
         game->board[0] = 1;
@@ -701,19 +684,24 @@ void add_wait(client_t *c) {
         
         c->game_id = game->id;
         opponent->game_id = game->id;
-        
         add_game(game);
-        
+
+        pthread_mutex_lock(&active_mutex);
+        act_game_thrds++; 
+        pthread_mutex_unlock(&active_mutex);
+
         pthread_t tid;
         if (pthread_create(&tid, NULL, game_thread, game) != 0) {
             perror("pthread_create failed");
             free(game);
             pthread_mutex_unlock(&global_mutex);
+            pthread_mutex_lock(&active_mutex);
+            act_game_thrds--; 
+            pthread_mutex_unlock(&active_mutex);  
             return;
         }
         pthread_detach(tid);
     } else {
-        // No opponent found, mark as waiting
         c->is_waiting = 1;
         send_wait(c->sock);
     }
@@ -724,16 +712,24 @@ void handle_client(int sock) {
     message_t msg;
     int msg_result;
     
-    msg_result = read_ngp_message(sock, &msg);
+    msg_result = read_message(sock, &msg);
     
     if (msg_result < 0) {
         close(sock);
         return;
     }
-    
+
+    if (msg.type == MSG_MOVE) {
+        send_fail(sock, 24, "Not Playing");
+        close(sock);
+        free_message(&msg);
+        return;
+    }
+
     if (msg_result > 0 || msg.type != MSG_OPEN) {
         send_fail(sock, 10, "Invalid");
         close(sock);
+        free_message(&msg);
         return;
     }
     
@@ -745,10 +741,10 @@ void handle_client(int sock) {
     }
     
     const char *name = msg.fields[0];
-    int name_valid = validate_name_field(name);
+    int name_check = name_valid(name);
     
-    if (name_valid != 0) {
-        if (name_valid == 21) {
+    if (name_check != 0) {
+        if (name_check == 21) {
             send_fail(sock, 21, "Long Name");
         } else {
             send_fail(sock, 10, "Invalid");
@@ -758,7 +754,7 @@ void handle_client(int sock) {
         return;
     }
     
-    if (is_name_in_use(name)) {
+    if (name_use(name)) {
         send_fail(sock, 22, "Already Playing");
         close(sock);
         free_message(&msg);
@@ -778,7 +774,7 @@ void handle_client(int sock) {
     c->game_id = -1;
     c->player_num = 0;
     c->is_waiting = 0;
-    c->is_playing = 0; /* not yet in a game */
+    c->is_playing = 0; 
     
     free_message(&msg);
     
@@ -786,10 +782,14 @@ void handle_client(int sock) {
     add_wait(c);
 }
 
-/* wrapper used by pthread_create */
 void *client_thread(void *arg) {
     int sock = (intptr_t)arg;
     handle_client(sock);
+
+    pthread_mutex_lock(&active_mutex);
+    act_client_thrds--;
+    pthread_cond_signal(&active_cond);  
+    pthread_mutex_unlock(&active_mutex);
     return NULL;
 }
 
@@ -817,11 +817,18 @@ int main(int argc, char **argv) {
             if (active) perror("accept failed");
             continue;
         }
-        
+
+        pthread_mutex_lock(&active_mutex);
+        act_client_thrds++;  
+        pthread_mutex_unlock(&active_mutex);
+
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, (void *)(intptr_t)sock) != 0) {
             perror("pthread_create failed");
             close(sock);
+            pthread_mutex_lock(&active_mutex);
+            act_client_thrds--; 
+            pthread_mutex_unlock(&active_mutex);
             continue;
         }
         pthread_detach(tid);
@@ -830,13 +837,19 @@ int main(int argc, char **argv) {
     close(listener);
     
     pthread_mutex_lock(&global_mutex);
+    pthread_mutex_lock(&active_mutex);
+    while (act_client_thrds > 0 || act_game_thrds > 0) {
+        pthread_cond_wait(&active_cond, &active_mutex);
+    }
+    pthread_mutex_unlock(&active_mutex);
+
     for (int i = 0; i < client_count; i++) {
         close(clients[i]->sock);
         free(clients[i]->name);
         free(clients[i]);
     }
     free(clients);
-    
+
     for (int i = 0; i < game_count; i++) {
         pthread_mutex_destroy(&games[i]->lock);
         free(games[i]);
