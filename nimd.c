@@ -65,7 +65,7 @@ int next_game_id = 1;
 
 pthread_mutex_t global_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void logf(const char *fmt, ...) {
+static void nim_logf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -444,7 +444,7 @@ void *game_thread(void *arg) {
     client_t *p1 = game->player1;
     client_t *p2 = game->player2;
     
-    logf("Game %d started: %s vs %s", game->id, p1->name, p2->name);
+    nim_logf("Game %d started: %s vs %s", game->id, p1->name, p2->name);
     
     send_name(p1->sock, 1, p2->name);
     send_name(p2->sock, 2, p1->name);
@@ -537,7 +537,7 @@ void *game_thread(void *arg) {
             int read_result = read_ngp_message(current_player->sock, &msg);
 
             if (read_result < 0) {
-                logf("Game %d: Player %d disconnected", game->id, cur_turn);
+                nim_logf("Game %d: Player %d disconnected", game->id, cur_turn);
                 if (current_player->sock >= 0) { close(current_player->sock); current_player->sock = -1; }
                 pthread_mutex_lock(&game->lock);
                 game->game_over = 1;
@@ -612,13 +612,13 @@ void *game_thread(void *arg) {
             }
 
             game->board[pile] -= qty;
-            logf("Game %d: Player %d removed %d from pile %d", game->id, cur_turn, qty, pile);
+            nim_logf("Game %d: Player %d removed %d from pile %d", game->id, cur_turn, qty, pile);
 
             if (is_board_empty(game->board)) {
                 game->game_over = 1;
                 game->winner = cur_turn;
                 game->forfeited = 0;
-                logf("Game %d: Player %d won", game->id, game->winner);
+                nim_logf("Game %d: Player %d won", game->id, game->winner);
             } else {
                 game->current_turn = (cur_turn == 1) ? 2 : 1;
             }
@@ -675,12 +675,12 @@ void add_wait(client_t *c) {
             fprintf(stderr, "malloc for game_t failed. Disconnecting clients.\n");
             close(c->sock);
             close(opponent->sock);
+            remove_client(c);
+            remove_client(opponent);
             free(c->name);
             free(opponent->name);
             free(c);
             free(opponent);
-            remove_client(c);
-            remove_client(opponent);
             pthread_mutex_unlock(&global_mutex);
             return;
         }
@@ -782,7 +782,7 @@ void handle_client(int sock) {
     
     free_message(&msg);
     
-    logf("Player %s connected", c->name);
+    nim_logf("Player %s connected", c->name);
     add_wait(c);
 }
 
@@ -806,7 +806,7 @@ int main(int argc, char **argv) {
     int listener = open_listener(service, QUEUE);
     if (listener < 0) exit(EXIT_FAILURE);
 
-    logf("Nim server listening on port %s", service);
+    nim_logf("Nim server listening on port %s", service);
 
     while (active) {
         struct sockaddr_storage remote_host;

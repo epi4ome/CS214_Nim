@@ -1,4 +1,42 @@
-Group:
-1. Audrey Wang (aw1086)
-2. Oscar Iwaniuk (oi66)
+Project IV test programs
+========================
 
+This archive contains two programs you may use to test your
+implementation of nimd.
+
+testc
+-----
+
+    Usage: testc <host> <port> <name>
+
+testc is a basic client for the Nim game service. Users specify
+the host and port of the server they wish to connect to and their
+name. testc will then set up the connection, wait to be matched
+into a game, and prompt the player to choose a pile and an amount
+of stones to remove when it is their turn.
+
+testc will prevent the user from moving out of turn, or from making
+illegal moves.
+
+rawc
+----
+
+    Usage: rawc <host> <port>
+
+rawc opens a connection to the specified host and service and waits
+for input from standard input or from the connection.
+
+Data received from standard input will be transmitted to the remote
+host, except for any trailing newline character.
+
+Data received from the remote host will be printed to standard
+output, with special attention for control and high-ASCII characters,
+which might otherwise be missed.
+
+Note that rawc has no knowledge of understanding of NGP, so you
+will need to formulate correct messages yourself. Obviously, this
+is only useful for debugging, when you want to control exactly what
+bytes are sent to the server or see exactly what bytes you have
+received.
+
+The source code for rawc is included.
