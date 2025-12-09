@@ -17,9 +17,8 @@ main (int argc, char **argv)
     }
 
     int sock = connect_inet (argv[1], argv[2]);
-	char buf[BUFLEN];
-	int bytes;
-	int sent_open = 0;
+    if (sock < 0) exit (EXIT_FAILURE);
+
     struct pollfd pfds[2];
     pfds[0].fd     = STDIN_FILENO;
     pfds[0].events = POLLIN;
@@ -40,25 +39,7 @@ main (int argc, char **argv)
 	    bytes = read (STDIN_FILENO, buf, BUFLEN);
 
 	    if (bytes < 1) {
-			buf[bytes] = 0;
 		printf("Exiting\n");
-			if (!sent_open) {
-				// Format and send NGP OPEN message
-				char payload[BUFLEN];
-				snprintf(payload, sizeof(payload), "OPEN|%s|", buf);
-				int plen = strlen(payload);
-				char header[8];
-				int hlen = snprintf(header, sizeof(header), "0|%02d|", plen);
-				char msg[BUFLEN];
-				snprintf(msg, sizeof(msg), "%s%s", header, payload);
-				printf("Sending %d bytes\n", hlen + plen);
-				write(sock, msg, hlen + plen);
-				sent_open = 1;
-			} else {
-				// For subsequent input, just send as-is (could be extended for MOVE, etc.)
-				printf("Sending %d bytes\n", bytes);
-				write(sock, buf, bytes);
-			}
 		break;
 	    }
 
