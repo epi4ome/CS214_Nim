@@ -530,15 +530,8 @@ void *game_thread(void *arg) {
             if (r == 0 && imsg.type == MSG_MOVE) {
                 nim_logf("Game %d: Player %d sent IMPATIENT move.", game->id, (cur_turn == 1) ? 2 : 1);
                 send_fail(other_player->sock, 31, "Impatient");
-                close(other_player->sock); other_player->sock = -1;
                 free_message(&imsg);
-                
-                pthread_mutex_lock(&game->lock);
-                game->game_over = 1;
-                game->winner = cur_turn;
-                game->forfeited = 0; 
-                pthread_mutex_unlock(&game->lock);
-                break;
+                continue; // Continue, do not break the loop or close the socket
             }
             
             if (r < 0 || r > 0) {
