@@ -16,26 +16,22 @@
 #include <time.h> 
 
 #define QUEUE 10
-#define MAX_PAYLOAD 99   /* payload (stated_len) max */
-#define MAX_TOTAL   104  /* header (5) + payload <= 104 */
+#define MAX_MSG_BYTES 104
 #define MAX_NAME_LEN 72
 #define INITIAL_CAP 10
 
 volatile int active = 1;
 
-/* Message types */
 typedef enum {
     MSG_OPEN, MSG_WAIT, MSG_NAME, MSG_PLAY, MSG_MOVE, MSG_OVER, MSG_FAIL, MSG_INVALID
 } msg_type_t;
 
-/* Parsed message structure */
 typedef struct {
     msg_type_t type;
     int field_count;
     char **fields;
 } message_t;
 
-/* Client and Game structures */
 typedef struct {
     int sock;
     char *name;
@@ -57,7 +53,6 @@ typedef struct {
     int forfeited;
 } game_t;
 
-/* Global lists protected by global_mutex */
 client_t **clients = NULL;
 int client_count = 0;
 int client_cap = 0;
@@ -75,7 +70,6 @@ pthread_mutex_t active_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t active_cond = PTHREAD_COND_INITIALIZER;
 
 static void nim_logf(const char *fmt, ...) {
-    if (!fmt) return;
     va_list ap;
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -84,14 +78,10 @@ static void nim_logf(const char *fmt, ...) {
     va_end(ap);
 }
 
-/* Signal handler to stop server */
 void handler(int signum) {
     (void)signum;
     active = 0;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Networking helpers */
 
 int open_listener(const char *service, int queue_size) {
     struct addrinfo hints, *res, *p;
@@ -110,9 +100,7 @@ int open_listener(const char *service, int queue_size) {
 
     for (p = res; p != NULL; p = p->ai_next) {
         listener_sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (listener_sock < 0) {
-            continue;
-        }
+        if (listener_sock < 0) continue;
         if (setsockopt(listener_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
             perror("setsockopt SO_REUSEADDR failed");
             close(listener_sock);
@@ -162,11 +150,9 @@ static msg_type_t decode_type(const char *t) {
     return MSG_INVALID;
 }
 
-/* send_ngp: build "0|LL|<payload>" and send, returns bytes sent or -1 */
 static ssize_t send_ngp(int fd, const char *payload) {
-    if (!payload) return -1;
     int len = (int)strlen(payload);
-    if (len > MAX_PAYLOAD) {
+    if (len > MAX_MSG_BYTES) {
         return -1;
     }
     char header[8];
@@ -174,16 +160,17 @@ static ssize_t send_ngp(int fd, const char *payload) {
     if (hlen < 0) {
         return -1;
     }
+
     int total = hlen + len;
-    if (total > MAX_TOTAL) {
+    char *buf = malloc((size_t)total + 1);
+    if (!buf) {
         return -1;
     }
-    char *buf = malloc((size_t)total + 1);
-    if (!buf) return -1;
+    
     memcpy(buf, header, (size_t)hlen);
     memcpy(buf + hlen, payload, (size_t)len);
     ssize_t sent = 0;
-    while (sent < total) {
+    while ((size_t)sent < (size_t)total) {
         ssize_t w = send(fd, buf + sent, (size_t)total - (size_t)sent, 0);
         if (w < 0) {
             if (errno == EINTR) continue;
@@ -196,9 +183,7 @@ static ssize_t send_ngp(int fd, const char *payload) {
     return sent;
 }
 
-/* Safe wrappers that check length and log errors */
 static void send_fail(int fd, int code, const char *msg) {
-    if (fd < 0) return;
     char payload[256];
     int n = snprintf(payload, sizeof(payload), "FAIL|%d %s|", code, msg);
     if (n < 0) return;
@@ -207,8 +192,7 @@ static void send_fail(int fd, int code, const char *msg) {
 }
 
 static void send_wait(int fd) {
-    if (fd < 0) return;
-    if (send_ngp(fd, "WAIT|") < 0) nim_logf("send_wait: send failed (fd=%d)", fd);
+    send_ngp(fd, "WAIT|");
 }
 
 static void send_name(client_t *c, int role, const char *opp_name) {
@@ -231,25 +215,21 @@ static void send_over(client_t *c, int winner, int board[5], int forfeited) {
     char payload[256];
     if (forfeited) {
         snprintf(payload, sizeof(payload), "OVER|%d|%s|Forfeit|", winner, b);
-    } else {
+    } 
+    else {
         snprintf(payload, sizeof(payload), "OVER|%d|%s||", winner, b);
     }
     send_ngp(c->sock, payload);
 }
 
-/* -------------------------------------------------------------------------- */
-/* Message parsing */
-
-/* free parsed message */
 static void free_message(message_t *msg) {
     if (!msg) return;
-    if (msg->fields) {
-        for (int i = 0; i < msg->field_count; ++i) free(msg->fields[i]);
-        free(msg->fields);
+    for (int i = 0; i < msg->field_count; i++) {
+        free(msg->fields[i]);
     }
+    free(msg->fields);
     msg->fields = NULL;
     msg->field_count = 0;
-    msg->type = MSG_INVALID;
 }
 
 static int read_message(int fd, message_t *out) {
@@ -257,15 +237,15 @@ static int read_message(int fd, message_t *out) {
     out->fields = NULL;
     out->type = MSG_INVALID;
 
-    /* header buffer - make a little larger for safety */
-    char header[8];
+    char header[6];
     ssize_t r;
     size_t got = 0;
-
-    /* read exactly 5 header bytes: V|DD| */
+    
     while (got < 5) {
         r = recv(fd, header + got, 5 - got, 0);
-        if (r <= 0) return -1; /* disconnect or error */
+        if (r <= 0) {
+            return -1;
+        }
         got += (size_t)r;
     }
 
@@ -275,30 +255,28 @@ static int read_message(int fd, message_t *out) {
         !isdigit((unsigned char)header[3])) {
         return 10;
     }
-
+    
     int stated_len = (header[2] - '0') * 10 + (header[3] - '0');
     
     if (stated_len < 1 || stated_len > MAX_MSG_BYTES) {
         return 10;
     }
 
-    /* Validate total size doesn't exceed the allowed total */
-    if (5 + stated_len > MAX_TOTAL) {
-        return 10;
-    }
-
     char *payload = malloc((size_t)stated_len + 1);
-    if (!payload) return -1;
-
+    if (!payload) {
+        return -1;
+    }
+    
     size_t off = 0;
     while (off < (size_t)stated_len) {
         r = recv(fd, payload + off, (size_t)stated_len - off, 0);
-        if (r <= 0) { free(payload); return -1; }
+        if (r <= 0) {
+            free(payload);
+            return -1;
+        }
         off += (size_t)r;
     }
-    payload[stated_len] = '\0';
-
-    /* payload must end with '|' */
+    
     if (payload[stated_len - 1] != '|') {
         free(payload);
         return 10;
@@ -321,29 +299,27 @@ static int read_message(int fd, message_t *out) {
             tokens[count++] = token;
         }
     }
-
-    free(payload);
-
+    
     if (count < 1) {
-        for (int j = 0; j < count; ++j) free(tokens[j]);
+        free(save);
         return 10;
     }
-
+    
     out->type = decode_type(tokens[0]);
     if (out->type == MSG_INVALID) {
-        for (int j = 0; j < count; ++j) free(tokens[j]);
+        free(save);
         return 10;
     }
-
+    
     out->field_count = count - 1;
     if (out->field_count > 0) {
-        out->fields = calloc((size_t)out->field_count, sizeof(char*));
+        out->fields = (char **)calloc((size_t)out->field_count, sizeof(char*));
         if (!out->fields) {
-            for (int j = 0; j < count; ++j) free(tokens[j]);
+            free(save);
             return -1;
         }
-        for (int i = 0; i < out->field_count; ++i) {
-            out->fields[i] = tokens[i + 1]; /* transfer ownership */
+        for (int i = 0; i < out->field_count; i++) {
+            out->fields[i] = strdup(tokens[i + 1]);
         }
     }
     
@@ -364,62 +340,61 @@ static int name_valid(const char *name) {
     return 0;
 }
 
-int name_use(const char *name) {
+int name_check_status(const char *name) {
     pthread_mutex_lock(&global_mutex);
-    for (int i = 0; i < client_count; ++i) {
-        if (clients[i]->is_playing && strcmp(clients[i]->name, name) == 0) {
-            pthread_mutex_unlock(&global_mutex);
-            return 1;
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i]->name != NULL && strcmp(clients[i]->name, name) == 0) {
+            if (clients[i]->is_playing) {
+                pthread_mutex_unlock(&global_mutex);
+                return 22;
+            }
+            if (clients[i]->is_waiting) {
+                pthread_mutex_unlock(&global_mutex);
+                return 23;
+            }
         }
     }
     pthread_mutex_unlock(&global_mutex);
     return 0;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Global list helpers (caller must hold global_mutex for locked variants) */
-
-void ensure_client_capacity_locked(void) {
-    if (client_count == client_cap) {
-        int newcap = (client_cap == 0) ? INITIAL_CAP : client_cap * 2;
-        client_t **temp = (client_t **)realloc(clients, sizeof(client_t*) * newcap);
-        if (!temp) return; /* caller handles failure */
-        clients = temp;
-        client_cap = newcap;
-    }
-}
-
-void ensure_game_capacity_locked(void) {
-    if (game_count == game_cap) {
-        int newcap = (game_cap == 0) ? INITIAL_CAP : game_cap * 2;
-        game_t **temp = (game_t **)realloc(games, sizeof(game_t*) * newcap);
-        if (!temp) return;
-        games = temp;
-        game_cap = newcap;
-    }
-}
-
-void add_game_locked(game_t *g) {
-    if (!g) return;
-    ensure_game_capacity_locked();
-    if (game_count < game_cap) {
-        games[game_count++] = g;
-    } else {
-        /* last-resort growth attempt */
-        int newcap = (game_cap == 0) ? INITIAL_CAP : game_cap * 2;
-        game_t **temp = (game_t **)realloc(games, sizeof(game_t*) * newcap);
-        if (temp) {
-            games = temp;
-            game_cap = newcap;
-            games[game_count++] = g;
-        } else {
-            nim_logf("add_game_locked: failed to resize game array");
+int name_use(const char *name) {
+    pthread_mutex_lock(&global_mutex);
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i]->name != NULL && strcmp(clients[i]->name, name) == 0) {
+            if (clients[i]->is_playing || clients[i]->is_waiting) {
+                pthread_mutex_unlock(&global_mutex);
+                return 1;
+            }
         }
     }
+    pthread_mutex_unlock(&global_mutex);
+    return 0;
 }
 
-void remove_client_locked(client_t *c) {
-    for (int i = 0; i < client_count; ++i) {
+void add_client(client_t *c) {
+    pthread_mutex_lock(&global_mutex);
+    
+    if (client_count == client_cap) {
+        if (client_cap == 0) {
+            client_cap = INITIAL_CAP;
+        } else {
+            client_cap = client_cap * 2;
+        }
+        client_t **temp = (client_t **)realloc(clients, sizeof(client_t*) * client_cap);
+        if (temp == NULL) {
+            pthread_mutex_unlock(&global_mutex);
+            return;
+        }
+        clients = temp;
+    }
+    
+    clients[client_count++] = c;
+    pthread_mutex_unlock(&global_mutex);
+}
+
+void remove_client(client_t *c) {
+    for (int i = 0; i < client_count; i++) {
         if (clients[i] == c) {
             clients[i] = clients[client_count - 1];
             client_count--;
@@ -454,27 +429,22 @@ void remove_game(int game_id) {
             break;
         }
     }
+    pthread_mutex_unlock(&global_mutex);
 }
 
-/* -------------------------------------------------------------------------- */
-/* Nim rules helpers */
-
 int is_board_empty(int board[5]) {
-    for (int i = 0; i < 5; ++i) if (board[i] > 0) return 0;
+    for (int i = 0; i < 5; i++) {
+        if (board[i] > 0) return 0;
+    }
     return 1;
 }
 
-/* validate move: 0 ok, 32 pile error, 33 qty error */
 int validate_move(int board[5], int pile, int qty) {
     if (pile < 0 || pile >= 5) return 32;
-    if (qty <= 0) return 33;
-    if (board[pile] < 0) return 33; /* defensive */
+    if (qty < 1) return 33;
     if (qty > board[pile]) return 33;
     return 0;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Per-game thread (implements extra-credit behavior) */
 
 void *game_thread(void *arg) {
     game_t *game = (game_t *)arg;
@@ -543,12 +513,6 @@ void *game_thread(void *arg) {
             break;
         }
 
-        /* check FD_SETSIZE bounds */
-        if (maxfd >= FD_SETSIZE) {
-            nim_logf("Error: socket fd %d >= FD_SETSIZE (%d)", maxfd, FD_SETSIZE);
-            break;
-        }
-
         int sel = select(maxfd + 1, &rfds, NULL, NULL, NULL); 
         
         if (sel < 0) {
@@ -568,7 +532,13 @@ void *game_thread(void *arg) {
                 send_fail(other_player->sock, 31, "Impatient");
                 close(other_player->sock); other_player->sock = -1;
                 free_message(&imsg);
-                continue; 
+                
+                pthread_mutex_lock(&game->lock);
+                game->game_over = 1;
+                game->winner = cur_turn;
+                game->forfeited = 0; 
+                pthread_mutex_unlock(&game->lock);
+                break;
             }
             
             if (r < 0 || r > 0) {
@@ -618,7 +588,6 @@ void *game_thread(void *arg) {
             }
 
             if (msg.type != MSG_MOVE) {
-                /* sending anything other than MOVE during your turn is invalid -> FAIL 10 and close */
                 send_fail(current_player->sock, 10, "Invalid");
                 if (current_player->sock >= 0) {
                     close(current_player->sock);
@@ -630,25 +599,24 @@ void *game_thread(void *arg) {
                 game->game_over = 1;
                 game->forfeited = 0;
                 pthread_mutex_unlock(&game->lock);
+                free_message(&msg);
                 break;
             }
 
             if (msg.field_count != 2) {
-                /* presentation error: FAIL 10 and close -> opponent wins */
                 send_fail(current_player->sock, 10, "Invalid");
-                free_message(&msg);
                 if (current_player->sock >= 0) { close(current_player->sock); current_player->sock = -1; }
                 pthread_mutex_lock(&game->lock);
                 if (cur_turn == 1) game->winner = 2; else game->winner = 1;
                 game->game_over = 1; game->forfeited = 0;
                 pthread_mutex_unlock(&game->lock);
+                free_message(&msg);
                 break;
             }
 
-            char *endptr = NULL;
-            errno = 0;
-            long pile_val = strtol(msg.fields[0], &endptr, 10);
-            if (errno == ERANGE || *endptr != '\0' || pile_val < 1 || pile_val > 5) {
+            char *end;
+            long pile_val = strtol(msg.fields[0], &end, 10);
+            if (*end != '\0' || pile_val < 1 || pile_val > 5) {
                 send_fail(current_player->sock, 32, "Pile Index");
                 free_message(&msg);
                 continue;
@@ -672,7 +640,6 @@ void *game_thread(void *arg) {
                 continue;
             }
 
-            /* Apply move */
             game->board[pile] -= qty;
             nim_logf("Game %d: Player %d removed %d from pile %d", game->id, cur_turn, qty, pile + 1);
 
@@ -707,8 +674,7 @@ void *game_thread(void *arg) {
     free(p2->name);
     free(p1);
     free(p2);
-
-    pthread_mutex_destroy(&game->lock);
+    remove_game(game->id);
     free(game);
 
     pthread_mutex_lock(&active_mutex);
@@ -719,18 +685,16 @@ void *game_thread(void *arg) {
     return NULL;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Matchmaking: add client to global list (under lock) and match if possible.
-   This function keeps global list operations atomic to avoid races. */
 void add_wait(client_t *c) {
     add_client(c);
     nim_logf("DEBUG: Player %s connected. Checking for opponent.", c->name);
     pthread_mutex_lock(&global_mutex);
 
     client_t *opponent = NULL;
-    for (int i = 0; i < client_count; ++i) {
+    for (int i = 0; i < client_count; i++) {
         if (clients[i] != c && clients[i]->is_waiting && !clients[i]->is_playing) {
             opponent = clients[i];
+            clients[i]->is_waiting = 0;
             break;
         }
     }
@@ -747,8 +711,7 @@ void add_wait(client_t *c) {
             close(opponent->sock);
             for (int j = 0; j < client_count; j++) {
                 if (clients[j] == c || clients[j] == opponent) {
-                    clients[j] = clients[client_count - 1];
-                    client_count--;
+                    remove_client(clients[j]);
                     j--; 
                 }
             }
@@ -778,13 +741,8 @@ void add_wait(client_t *c) {
         opponent->game_id = game->id;
         add_game(game);
 
-        for (int i = 0; i < client_count; i++) {
-            if (clients[i] == c || clients[i] == opponent) {
-                clients[i] = clients[client_count - 1];
-                client_count--;
-                i--; 
-            }
-        }
+        remove_client(c);
+        remove_client(opponent);
 
         pthread_mutex_lock(&active_mutex);
         act_game_thrds++;
@@ -818,7 +776,7 @@ void add_wait(client_t *c) {
     nim_logf("DEBUG: add_wait finished for %s.", c->name);
 }
 
-void handle_client(int sock) {
+client_t *handle_client(int sock) {
     message_t msg;
     int msg_result;
     
@@ -826,32 +784,30 @@ void handle_client(int sock) {
     
     if (msg_result < 0) {
         close(sock);
-        return;
+        return NULL;
     }
 
     if (msg.type == MSG_MOVE) {
         send_fail(sock, 24, "Not Playing");
         close(sock);
         free_message(&msg);
-        return;
+        return NULL;
     }
 
     if (msg_result > 0 || msg.type != MSG_OPEN) {
         send_fail(sock, 10, "Invalid");
-        free_message(&msg);
         close(sock);
         free_message(&msg);
-        return;
+        return NULL;
     }
-
-    /* Expect exactly 1 field: player name */
+    
     if (msg.field_count != 1) {
         send_fail(sock, 10, "Invalid");
-        free_message(&msg);
         close(sock);
-        return;
+        free_message(&msg);
+        return NULL;
     }
-
+    
     const char *name = msg.fields[0];
     int name_check = name_valid(name);
     
@@ -863,25 +819,29 @@ void handle_client(int sock) {
         }
         close(sock);
         free_message(&msg);
-        close(sock);
-        return;
+        return NULL;
     }
     
-    if (name_use(name)) {
-        send_fail(sock, 22, "Already Playing");
-        free_message(&msg);
+    int status_check = name_check_status(name);
+    if (status_check != 0) {
+        if (status_check == 22) {
+            send_fail(sock, 22, "Already Playing");
+        } else {
+            send_fail(sock, 23, "Already Open");
+        }
         close(sock);
-        return;
+        free_message(&msg);
+        return NULL;
     }
-
-    /* allocate client structure */
-    client_t *c = calloc(1, sizeof(client_t));
+    
+    client_t *c = (client_t *)malloc(sizeof(client_t));
     if (!c) {
         send_fail(sock, 10, "Invalid");
-        free_message(&msg);
         close(sock);
-        return;
+        free_message(&msg);
+        return NULL;
     }
+    
     c->sock = sock;
     c->name = strdup(name);
     c->game_id = -1;
@@ -890,67 +850,76 @@ void handle_client(int sock) {
     c->is_playing = 0; 
     
     free_message(&msg);
-
-    /* Check for immediate second message (non-blocking). If client
-       sends OPEN again -> FAIL 23. If client sends MOVE before NAME -> FAIL 24. */
-    fd_set rfds;
-    struct timeval tv = {0, 0};
-    FD_ZERO(&rfds);
-    FD_SET(sock, &rfds);
-    int r = select(sock + 1, &rfds, NULL, NULL, &tv);
-    if (r > 0 && FD_ISSET(sock, &rfds)) {
-        message_t msg2;
-        int r2 = read_ngp_message(sock, &msg2);
-        if (r2 < 0) {
-            /* disconnected while setting up */
-            free(c->name);
-            free(c);
-            close(sock);
-            return;
-        }
-        if (r2 > 0) {
-            /* protocol error on second message - close */
-            send_fail(sock, r2, "Invalid");
-            free_message(&msg2);
-            free(c->name);
-            free(c);
-            close(sock);
-            return;
-        }
-        if (msg2.type == MSG_OPEN) {
-            send_fail(sock, 23, "Already Open");
-            free_message(&msg2);
-            free(c->name);
-            free(c);
-            close(sock);
-            return;
-        } else if (msg2.type == MSG_MOVE) {
-            send_fail(sock, 24, "Not Playing");
-            free_message(&msg2);
-            free(c->name);
-            free(c);
-            close(sock);
-            return;
-        } else {
-            send_fail(sock, 10, "Invalid");
-            free_message(&msg2);
-            free(c->name);
-            free(c);
-            close(sock);
-            return;
-        }
-    }
-
+    
     nim_logf("Player %s connected", c->name);
     add_wait(c);
+
+    if (c->is_playing) { 
+        free(c->name); 
+        free(c);
+        return NULL; 
+    }
+    return c;
 }
 
 void *client_thread(void *arg) {
-    if (!arg) return NULL;
-    int sock = *((int *)arg);
-    free(arg);
-    handle_client(sock);
+    int sock = (intptr_t)arg;
+    client_t *c = handle_client(sock);
 
+    if (c != NULL) {
+        fd_set rfds;
+        struct timeval tv;
+        int break_loop = 0;
+        while (active && c->is_waiting && !break_loop) {
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000; 
+            FD_ZERO(&rfds);
+            FD_SET(c->sock, &rfds);
+
+            int sel = select(c->sock + 1, &rfds, NULL, NULL, &tv);
+
+            if (sel < 0) {
+                if (errno != EINTR) break;
+            } else if (sel > 0 && FD_ISSET(c->sock, &rfds)) {
+                message_t msg;
+                int read_result = read_message(c->sock, &msg);
+
+                if (read_result < 0) {
+                    break;
+                }
+                
+                int fail_code;
+                const char *fail_msg;
+
+                if (msg.type == MSG_OPEN) {
+                    fail_code = 23;
+                    fail_msg = "Already Open";
+                } else if (msg.type == MSG_MOVE) {
+                    fail_code = 24;
+                    fail_msg = "Not Playing";
+                } else {
+                    fail_code = 10;
+                    fail_msg = "Invalid Message";
+                }
+
+                send_fail(c->sock, fail_code, fail_msg);
+                
+                free_message(&msg);
+                break_loop = 1;
+            }
+        }
+
+        pthread_mutex_lock(&global_mutex);
+        if (c->is_waiting) { 
+            close(c->sock);
+            remove_client(c);
+            free(c->name);
+            free(c);
+            nim_logf("DEBUG: Waiting client disconnected/cleaned up");
+        }
+        pthread_mutex_unlock(&global_mutex);
+    }
+    
     pthread_mutex_lock(&active_mutex);
     act_client_thrds--;
     pthread_cond_signal(&active_cond);  
@@ -958,13 +927,14 @@ void *client_thread(void *arg) {
     return NULL;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Main: listen and spawn client threads, shutdown cleanly */
-
 int main(int argc, char **argv) {
-    char *service = "15000";
-    if (argc >= 2) service = argv[1];
-
+    char *service;
+    if (argc >= 2) {
+        service = argv[1];
+    } else {
+        service = "15000";
+    }
+    
     install_handlers();
 
     int listener = open_listener(service, QUEUE);
@@ -975,7 +945,8 @@ int main(int argc, char **argv) {
     while (active) {
         struct sockaddr_storage remote_host;
         socklen_t remote_host_len = sizeof(remote_host);
-        int sock = accept(listener, (struct sockaddr*)&remote_host, &remote_host_len);
+
+        int sock = accept(listener, (struct sockaddr *)&remote_host, &remote_host_len);
         if (sock < 0) {
             if (errno == EINTR && !active) {
                 break; 
@@ -989,14 +960,7 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&active_mutex);
 
         pthread_t tid;
-        int *psock = malloc(sizeof(int));
-        if (!psock) {
-            perror("malloc failed");
-            close(sock);
-            continue;
-        }
-        *psock = sock;
-        if (pthread_create(&tid, NULL, client_thread, psock) != 0) {
+        if (pthread_create(&tid, NULL, client_thread, (void *)(intptr_t)sock) != 0) {
             perror("pthread_create failed");
             close(sock);
             pthread_mutex_lock(&active_mutex);
@@ -1008,8 +972,7 @@ int main(int argc, char **argv) {
     }
 
     close(listener);
-
-    /* Shutdown: close remaining clients and free resources */
+    
     pthread_mutex_lock(&global_mutex);
     pthread_mutex_lock(&active_mutex);
     while (act_client_thrds > 0 || act_game_thrds > 0) {
@@ -1029,9 +992,7 @@ int main(int argc, char **argv) {
         free(games[i]);
     }
     free(games);
-    games = NULL;
-    game_count = 0;
     pthread_mutex_unlock(&global_mutex);
-
+    
     return EXIT_SUCCESS;
 }
