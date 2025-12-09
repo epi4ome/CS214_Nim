@@ -741,9 +741,6 @@ void add_wait(client_t *c) {
         opponent->game_id = game->id;
         add_game(game);
 
-        remove_client(c);
-        remove_client(opponent);
-
         pthread_mutex_lock(&active_mutex);
         act_game_thrds++;
         pthread_mutex_unlock(&active_mutex);
@@ -754,17 +751,22 @@ void add_wait(client_t *c) {
         int err = pthread_create(&tid, NULL, game_thread, game);
         if (err != 0) {
             nim_logf("ERROR: pthread_create failed: %s", strerror(err));
-            add_client(c);
-            add_client(opponent);
-            remove_game(game->id);
-            free(game);
+            c->is_waiting = 1;
+            c->is_playing = 0;
+            opponent->is_waiting = 1;
+            opponent->is_playing = 0;
             pthread_mutex_lock(&active_mutex);
             act_game_thrds--;
             pthread_mutex_unlock(&active_mutex);
+            remove_game(game->id);
+            free(game);
             pthread_mutex_unlock(&global_mutex);
             return;
         }
         pthread_detach(tid);
+
+        remove_client(c);
+        remove_client(opponent);
 
     } else {
         c->is_waiting = 1;
@@ -855,8 +857,6 @@ client_t *handle_client(int sock) {
     add_wait(c);
 
     if (c->is_playing) { 
-        free(c->name); 
-        free(c);
         return NULL; 
     }
     return c;
