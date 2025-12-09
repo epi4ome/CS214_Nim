@@ -167,6 +167,7 @@ static ssize_t send_ngp(int fd, const char *payload) {
     memcpy(buf + hlen, payload, (size_t)len);
     buf[total] = '\0';
 
+    printf("Checkpoint: check buffer: %s\n", buf);
     print_message("SENT", buf);
 
     ssize_t sent = 0;
@@ -180,6 +181,7 @@ static ssize_t send_ngp(int fd, const char *payload) {
         sent += w;
     }
     free(buf);
+    printf("Checkpoint: sent %zd bytes\n", sent);
     return sent;
 }
 
@@ -188,6 +190,7 @@ static void send_fail(int fd, int code, const char *msg) {
     int n = snprintf(payload, sizeof(payload), "FAIL|%d %s|", code, msg);
     if (n < 0) return;
     if (n > MAX_MSG_BYTES) return; 
+    printf("Checkpoint: payload: %s\n", payload);
     send_ngp(fd, payload);
 }
 
@@ -725,6 +728,23 @@ void add_wait(client_t *c) {
     pthread_mutex_unlock(&global_mutex);
 }
 
+void handle_error_23_name(const char *name) {
+    pthread_mutex_lock(&global_mutex);
+    for (int i = 0; i < client_count; i++) {
+        client_t *c = clients[i];
+        if (!c) continue;
+        if (c->name && strcmp(c->name, name) == 0 && c->is_waiting && !c->is_playing) {
+            if (c->sock >= 0) {
+                /* shutdown wakes the other thread's select/recv but leaves FD details
+                   for that thread to close and free safely. Don't set c->sock = -1 here. */
+                shutdown(c->sock, SHUT_RDWR);
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&global_mutex);
+}
+
 client_t *handle_client(int sock) {
     message_t msg;
     int msg_result;
@@ -775,13 +795,27 @@ client_t *handle_client(int sock) {
     if (status_check != 0) {
         if (status_check == 22) {
             send_fail(sock, 22, "Already Playing");
-        } else {
+            sleep(1);
+
+            /* Already Playing: just close the new client's socket */
+            free_message(&msg);
+            close(sock);
+            printf("Checkpoint: fail 22\n");
+            return NULL;
+        } else { /* 23 */
+            /* Send FAIL to the new connection first (blocking send_ngp) */
             send_fail(sock, 23, "Already Open");
+            /* Wake the waiting client so its thread will cleanup (and remove/free) */
+            handle_error_23_name(name);
+
+            /* Now close the new client's socket and return */
+            free_message(&msg);
+            close(sock);
+            printf("Checkpoint: fail 23\n");
+            return NULL;
         }
-        close(sock);
-        free_message(&msg);
-        return NULL;
     }
+
     
     client_t *c = (client_t *)malloc(sizeof(client_t));
     if (!c) {
@@ -806,6 +840,7 @@ client_t *handle_client(int sock) {
     }
     return c;
 }
+
 
 void *client_thread(void *arg) {
     int sock = (intptr_t)arg;
