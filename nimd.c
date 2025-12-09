@@ -69,13 +69,9 @@ int act_game_thrds = 0;
 pthread_mutex_t active_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t active_cond = PTHREAD_COND_INITIALIZER;
 
-static void nim_logf(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    printf("\n");
+static void print_message(const char *direction, const char *raw_msg) {
+    printf("%s: %s\n", direction, raw_msg);
     fflush(stdout);
-    va_end(ap);
 }
 
 void handler(int signum) {
@@ -169,6 +165,10 @@ static ssize_t send_ngp(int fd, const char *payload) {
     
     memcpy(buf, header, (size_t)hlen);
     memcpy(buf + hlen, payload, (size_t)len);
+    buf[total] = '\0';
+
+    print_message("SENT", buf);
+
     ssize_t sent = 0;
     while ((size_t)sent < (size_t)total) {
         ssize_t w = send(fd, buf + sent, (size_t)total - (size_t)sent, 0);
@@ -283,6 +283,12 @@ static int read_message(int fd, message_t *out) {
     }
     payload[stated_len] = '\0'; 
 
+    char full_msg[5 + MAX_MSG_BYTES + 1]; 
+    if (stated_len <= MAX_MSG_BYTES) {
+        memcpy(full_msg, header, 5);
+        memcpy(full_msg + 5, payload, stated_len + 1);
+        print_message("RECV", full_msg);
+    }
     char *save = strdup(payload);
     free(payload);
     if (!save) {
@@ -342,32 +348,32 @@ static int name_valid(const char *name) {
 
 int name_check_status(const char *name) {
     pthread_mutex_lock(&global_mutex);
-    for (int i = 0; i < client_count; i++) {
-        if (clients[i]->name != NULL && strcmp(clients[i]->name, name) == 0) {
-            if (clients[i]->is_playing) {
-                pthread_mutex_unlock(&global_mutex);
-                return 22;
-            }
-            if (clients[i]->is_waiting) {
-                pthread_mutex_unlock(&global_mutex);
-                return 23;
-            }
-        }
-    }
-    pthread_mutex_unlock(&global_mutex);
-    return 0;
-}
 
-int name_use(const char *name) {
-    pthread_mutex_lock(&global_mutex);
     for (int i = 0; i < client_count; i++) {
         if (clients[i]->name != NULL && strcmp(clients[i]->name, name) == 0) {
-            if (clients[i]->is_playing || clients[i]->is_waiting) {
-                pthread_mutex_unlock(&global_mutex);
-                return 1;
-            }
+            pthread_mutex_unlock(&global_mutex);
+            return 23;
         }
     }
+    
+    for (int i = 0; i < game_count; i++) {
+        game_t *g = games[i];
+        pthread_mutex_lock(&g->lock); 
+        
+        if (g->player1 != NULL && g->player1->name != NULL && strcmp(g->player1->name, name) == 0) {
+            pthread_mutex_unlock(&g->lock);
+            pthread_mutex_unlock(&global_mutex);
+            return 22;
+        }
+        if (g->player2 != NULL && g->player2->name != NULL && strcmp(g->player2->name, name) == 0) {
+            pthread_mutex_unlock(&g->lock);
+            pthread_mutex_unlock(&global_mutex);
+            return 22;
+        }
+        
+        pthread_mutex_unlock(&g->lock);
+    }
+    
     pthread_mutex_unlock(&global_mutex);
     return 0;
 }
@@ -451,20 +457,9 @@ void *game_thread(void *arg) {
     client_t *p1 = game->player1;
     client_t *p2 = game->player2;
 
-    nim_logf("Game %d started: %s vs %s", game->id, p1->name, p2->name);
-
-    struct timespec ts;
-    ts.tv_sec = 1; 
-    ts.tv_nsec = 0;
-    nanosleep(&ts, NULL);
-
     send_name(p1, 1, p2->name);
     send_name(p2, 2, p1->name);
     
-    ts.tv_sec = 0;
-    ts.tv_nsec = 50000 * 1000;
-    nanosleep(&ts, NULL);
-
     game->current_turn = 1;
 
     while (active && !game->game_over) {
@@ -490,13 +485,13 @@ void *game_thread(void *arg) {
         fd_set rfds;
         FD_ZERO(&rfds);
         int maxfd = -1;
+        
         if (current_player->sock >= 0) {
             FD_SET(current_player->sock, &rfds);
             if (current_player->sock > maxfd) {
                 maxfd = current_player->sock;
             }
         }
-
         if (other_player->sock >= 0) { 
             FD_SET(other_player->sock, &rfds);
             if (other_player->sock > maxfd) {
@@ -528,22 +523,11 @@ void *game_thread(void *arg) {
             int r = read_message(other_player->sock, &imsg);
             
             if (r == 0 && imsg.type == MSG_MOVE) {
-                nim_logf("Game %d: Player %d sent IMPATIENT move.", game->id, (cur_turn == 1) ? 2 : 1);
                 send_fail(other_player->sock, 31, "Impatient");
-                close(other_player->sock); other_player->sock = -1;
                 free_message(&imsg);
-                
-                pthread_mutex_lock(&game->lock);
-                game->game_over = 1;
-                game->winner = cur_turn;
-                game->forfeited = 0; 
-                pthread_mutex_unlock(&game->lock);
-                break;
+                continue; 
             }
             
-            if (r < 0 || r > 0) {
-                nim_logf("Game %d: Player %d disconnected", game->id, (cur_turn == 1) ? 2 : 1);
-            }
             if (other_player->sock >= 0) { close(other_player->sock); other_player->sock = -1; }
         
             pthread_mutex_lock(&game->lock);
@@ -560,7 +544,6 @@ void *game_thread(void *arg) {
             int read_result = read_message(current_player->sock, &msg);
 
             if (read_result < 0) {
-                nim_logf("Game %d: Player %d disconnected", game->id, cur_turn);
                 if (current_player->sock >= 0) {
                     close(current_player->sock);
                     current_player->sock = -1;
@@ -574,64 +557,42 @@ void *game_thread(void *arg) {
                 break;
             } else if (read_result > 0) {
                 send_fail(current_player->sock, read_result, "Invalid");
-                if (current_player->sock >= 0) {
-                    close(current_player->sock);
-                    current_player->sock = -1;
-                }
-                pthread_mutex_lock(&game->lock);
-                if (cur_turn == 1) game->winner = 2;
-                else game->winner = 1;
-                game->game_over = 1;
-                game->forfeited = 0;
-                pthread_mutex_unlock(&game->lock);
-                break;
+                continue;
             }
 
             if (msg.type != MSG_MOVE) {
                 send_fail(current_player->sock, 10, "Invalid");
-                if (current_player->sock >= 0) {
-                    close(current_player->sock);
-                    current_player->sock = -1;
-                }
-                pthread_mutex_lock(&game->lock);
-                if (cur_turn == 1) game->winner = 2;
-                else game->winner = 1;
-                game->game_over = 1;
-                game->forfeited = 0;
-                pthread_mutex_unlock(&game->lock);
                 free_message(&msg);
-                break;
+                continue;
             }
 
             if (msg.field_count != 2) {
                 send_fail(current_player->sock, 10, "Invalid");
-                if (current_player->sock >= 0) { close(current_player->sock); current_player->sock = -1; }
-                pthread_mutex_lock(&game->lock);
-                if (cur_turn == 1) game->winner = 2; else game->winner = 1;
-                game->game_over = 1; game->forfeited = 0;
-                pthread_mutex_unlock(&game->lock);
                 free_message(&msg);
-                break;
+                continue;
             }
 
             char *end;
             long pile_val = strtol(msg.fields[0], &end, 10);
-            if (*end != '\0' || pile_val < 1 || pile_val > 5) {
+            
+            if (*end != '\0' || pile_val < 0 || pile_val > 4) {
                 send_fail(current_player->sock, 32, "Pile Index");
                 free_message(&msg);
                 continue;
             }
+            int pile = (int)pile_val; 
+
             long qty_val = strtol(msg.fields[1], &end, 10);
             if (*end != '\0' || qty_val < 1 || qty_val > INT_MAX) {
                 send_fail(current_player->sock, 33, "Quantity");
                 free_message(&msg);
                 continue;
             }
-            int pile = (int)(pile_val - 1);
             int qty = (int)qty_val;
 
             pthread_mutex_lock(&game->lock);
             int valid = validate_move(game->board, pile, qty);
+            
             if (valid != 0) {
                 pthread_mutex_unlock(&game->lock);
                 if (valid == 32) send_fail(current_player->sock, 32, "Pile Index");
@@ -641,30 +602,27 @@ void *game_thread(void *arg) {
             }
 
             game->board[pile] -= qty;
-            nim_logf("Game %d: Player %d removed %d from pile %d", game->id, cur_turn, qty, pile + 1);
 
             if (is_board_empty(game->board)) {
                 game->game_over = 1;
                 game->winner = cur_turn;
                 game->forfeited = 0;
-                nim_logf("Game %d: Player %d won", game->id, game->winner);
             } else {
-                if (cur_turn == 1) game->current_turn = 2;
-                else game->current_turn = 1;
+                game->current_turn = (cur_turn == 1) ? 2 : 1;
             }
             pthread_mutex_unlock(&game->lock);
 
             free_message(&msg);
+            
+            if (game->game_over && game->forfeited == 0) {
+                break;
+            }
         }
     }
 
     if (game->game_over) {
         if (p1->sock >= 0) send_over(p1, game->winner, game->board, game->forfeited);
         if (p2->sock >= 0) send_over(p2, game->winner, game->board, game->forfeited);
-        nim_logf("Game %d over: winner=%d, forfeited=%d, final board=%d %d %d %d %d",
-            game->id, game->winner, game->forfeited,
-            game->board[0], game->board[1], game->board[2],
-            game->board[3], game->board[4]);
     }
 
     if (p1->sock >= 0) { close(p1->sock); p1->sock = -1; }
@@ -687,34 +645,30 @@ void *game_thread(void *arg) {
 
 void add_wait(client_t *c) {
     add_client(c);
-    nim_logf("DEBUG: Player %s connected. Checking for opponent.", c->name);
     pthread_mutex_lock(&global_mutex);
 
     client_t *opponent = NULL;
     for (int i = 0; i < client_count; i++) {
         if (clients[i] != c && clients[i]->is_waiting && !clients[i]->is_playing) {
             opponent = clients[i];
-            clients[i]->is_waiting = 0;
             break;
         }
     }
 
     if (opponent) {
-        nim_logf("DEBUG: Opponent found: %s. Initiating game setup.", opponent->name);
+        send_wait(c->sock); 
+        remove_client(c);
+        remove_client(opponent); 
+
         c->is_waiting = 0;
         c->is_playing = 1;
+        opponent->is_waiting = 0;
         opponent->is_playing = 1;
 
         game_t *game = (game_t *)malloc(sizeof(game_t));
         if (!game) {
             close(c->sock);
             close(opponent->sock);
-            for (int j = 0; j < client_count; j++) {
-                if (clients[j] == c || clients[j] == opponent) {
-                    remove_client(clients[j]);
-                    j--; 
-                }
-            }
             free(c->name);
             free(opponent->name);
             free(c);
@@ -725,7 +679,7 @@ void add_wait(client_t *c) {
 
         game->id = next_gid++;
         game->player1 = opponent;
-        game->player2 = c;
+        game->player2 = c; 
         game->board[0] = 1;
         game->board[1] = 3;
         game->board[2] = 5;
@@ -741,21 +695,18 @@ void add_wait(client_t *c) {
         opponent->game_id = game->id;
         add_game(game);
 
-        remove_client(c);
-        remove_client(opponent);
-
         pthread_mutex_lock(&active_mutex);
         act_game_thrds++;
         pthread_mutex_unlock(&active_mutex);
-
-        nim_logf("DEBUG: Attempting to create Game %d thread.", game->id);
-
         pthread_t tid;
         int err = pthread_create(&tid, NULL, game_thread, game);
         if (err != 0) {
-            nim_logf("ERROR: pthread_create failed: %s", strerror(err));
-            add_client(c);
-            add_client(opponent);
+            close(c->sock);
+            close(opponent->sock);
+            free(c->name);
+            free(opponent->name);
+            free(c);
+            free(opponent);
             remove_game(game->id);
             free(game);
             pthread_mutex_lock(&active_mutex);
@@ -769,11 +720,9 @@ void add_wait(client_t *c) {
     } else {
         c->is_waiting = 1;
         send_wait(c->sock);
-        nim_logf("DEBUG: No opponent found for %s. Sending WAIT message.", c->name);
     }
 
     pthread_mutex_unlock(&global_mutex);
-    nim_logf("DEBUG: add_wait finished for %s.", c->name);
 }
 
 client_t *handle_client(int sock) {
@@ -850,13 +799,9 @@ client_t *handle_client(int sock) {
     c->is_playing = 0; 
     
     free_message(&msg);
-    
-    nim_logf("Player %s connected", c->name);
     add_wait(c);
 
     if (c->is_playing) { 
-        free(c->name); 
-        free(c);
         return NULL; 
     }
     return c;
@@ -915,7 +860,6 @@ void *client_thread(void *arg) {
             remove_client(c);
             free(c->name);
             free(c);
-            nim_logf("DEBUG: Waiting client disconnected/cleaned up");
         }
         pthread_mutex_unlock(&global_mutex);
     }
@@ -940,7 +884,7 @@ int main(int argc, char **argv) {
     int listener = open_listener(service, QUEUE);
     if (listener < 0) exit(EXIT_FAILURE);
 
-    nim_logf("Nim server listening on port %s", service);
+    printf("Nim server listening on port %s\n", service); 
 
     while (active) {
         struct sockaddr_storage remote_host;
