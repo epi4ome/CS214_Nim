@@ -172,13 +172,16 @@ static ssize_t send_ngp(int fd, const char *payload) {
 
     ssize_t sent = 0;
     while ((size_t)sent < (size_t)total) {
+        printf("Checkpoint: sent so far: %zd bytes\ntotal: %d bytes\n", sent, total);
         ssize_t w = send(fd, buf + sent, (size_t)total - (size_t)sent, 0);
+        printf("Checkpoint: send returned: %zd\n", w);
         if (w < 0) {
             if (errno == EINTR) continue;
             free(buf);
             return -1;
         }
         sent += w;
+        printf("Checkpoint: sent so far: %zd bytes\ntotal: %d bytes\n", sent, total);
     }
     free(buf);
     printf("Checkpoint: sent %zd bytes\n", sent);
