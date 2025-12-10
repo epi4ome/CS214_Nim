@@ -1,0 +1,137 @@
+Group:
+1. Audrey Wang (aw1086)
+2. Oscar Iwaniuk (oi66)
+
+Overall design: 
+    Our nimd server supports concurrent games and the extra-credit features.
+
+    To implement all required functionality, we defined three main structs (message, client, game) to represent the server’s state. Memory for both clients and games is dynamically allocated (resized when needed). The client array allows the server to track all players who are currently waiting for a match, while the game array (storing both player 1 and 2 for each game) tracks all active games and their associated clients. We also added a separate mutex to maintain accurate counts of active client and game threads, making sure that resources are not freed before all threads have fully exited.
+
+    For debugging purposes, the server also prints NGP messages it receives and sends to the terminal.
+
+Test plan: 
+
+    **1. Single game + ERROR CODE 31 (extra credit), 32, 33**
+    -------
+    (a) single game setup:
+        In the main terminal, compile nimd using make, and run: 
+            ./nimd 15000        
+    Server correctly prints out "Nim server listening on port 15000"
+
+        Then, in separate terminals, run:
+            ./testc localhost 15000 bob 
+            ./testc localhost 15000 sam
+    The server correctly sends OPEN and WAIT messages to both players. Testc should successfully set up the game, displaying:
+        "We are player 1; opponent sam" for Bob
+        "We are player 2; opponent bob" for Sam
+    The board is correctly initialized and presented as 1 3 5 7 9 at the start of the game.
+        
+    (b) testing ERROR CODE 31, 32, 33:
+        (Type the given numbers in each player’s client as indicated):
+        [bob]                   [sam]
+
+        6   //wrong
+    Entering an invalid pile number is correctly handled by the server, which sends a FAIL message with code 32 to the client. Since the game allows players to reselect, the game continues, and the player is prompted to select a pile again (this is the correct behavior for testc).
+
+        4
+        8 //wrong 
+    Only 1–7 are valid for pile 4. The server correctly sends a FAIL message with code 33 to the client. Since this error does not trigger a connection close, the game continues, with testc prompting the player to select the quantity again.
+
+        7 
+    The server now correctly sends 0|09|MOVE|3|7| (testc uses 0–4 for pile numbers) to the client. The new board is updated and sent to both players.
+        (Board: 1 3 5 0 9)
+        (waiting for sam)   
+        3 
+        (Shh.)   
+    The server responds with a FAIL message with code 31 (IMPATIENT) immediately after Bob tries to move during Sam's turn (extra-credit feature successful)
+                                
+                               1
+                               1
+        (Board: 0 3 5 0 9)    
+        2 
+        3
+        (Board: 0 0 5 0 9) 
+                               3
+                               5
+        (Board: 0 0 0 0 9)
+        1
+        9
+        (You win!)   
+              (You are defeated.)  
+    The server correctly sends 0|18|OVER|1|0 0 0 0 0|| to both players, indicating the result of the game. Both players are successfully disconnected from the server once the game ends.
+    
+    **2. Concurrent games + ERROR CODE 21, 22, 23**
+    -------
+    (a) queueing 2+ players:
+        On seperate terminals, type: 
+        ./testc localhost 15000 rob
+        ./testc localhost 15000 eric
+        ./testc localhost 15000 ally
+        ./testc localhost 15000 alice
+    rob and eric are queued for one game, while ally and alice are queued for another. Both games can be played simultaneously. If the second game with ally and alice ends, the server correctly closes both sockets, while the first game remains active.
+
+        ./testc localhost 15000 connor
+        ./testc localhost 15000 david
+    More games can be queued up. Once there are two players in the queue, the server will successfully start a new game.
+    
+    (b) checking ERROR CODE 21: 
+        ./testc localhost 15000 123456789012345678901234567890123456789012345678901234567890123456789012
+    This is the maximum allowed length for a player name (72 characters) and does not trigger error 21. Now, type on a new terminal:
+
+        ./testc localhost 15000 1234567890123456789012345678901234567890123456789012345678901234567890123
+    This exceeds the 72-character limit. The server correctly sends 0|18|FAIL|21 Long Name| to the client, allowing testc to display: "Names must be at most 72 chars."
+
+    (c) checking ERROR CODE 22, 23: 
+        ./rawc localhost 15000
+        0|09|OPEN|bob|
+            (Sending 14 bytes)
+            (Recv  10 [0|05|WAIT|])
+        0|09|OPEN|bob|
+            (Sending 14 bytes)
+            (Recv  26 [0|21|FAIL|23 Already Open|])
+        Socket EOF or error
+    When a client tries to OPEN twice, the server correctly responds with error code 23, and the client is no longer connected to the server.
+
+    Now in seperate terminals, run: 
+        ./rawc localhost 15000
+        0|09|OPEN|bob|
+            (Sending 14 bytes)
+            (Recv  10 [0|05|WAIT|])
+
+        ./rawc localhost 15000
+        0|09|OPEN|bob|
+        Sending 14 bytes
+        Recv  29 [0|24|FAIL|22 Already Playing|]
+        Socket EOF or error
+    Since Bob is already in the queue, the server correctly sends an "Already Playing" error and ends the client’s connection. This error triggers whether the player is in the queue or already in a game, ensuring that there are no duplicate names anywhere on the server.
+    
+    **3. Forfeit (extra credit)**
+    -------
+        Continuting in the connor and david game, in david's client type: 
+            ^c
+    The server correctly sends the message 0|25|OVER|1|1 3 5 7 9|Forfeit|, where Connor (player 1) is the winner since David's disconnection is considered a forfeit. Immediately, Connor receives the message indicating that David forfeited, satisfying the extra-credit requirement.
+    
+    **4. INVALIDs using rawc**
+    -------
+        Open a new server, then on a differnet terminal, run:
+            ./rawc localhost 15000
+        (then choose one of the following) 
+    (a) Message length is not two decimal digits followed by a vertical bar:
+            0|1|OPEN|joe|
+            0|AB|OPEN|joe|
+            0|123|OPEN|joe|
+
+    (b) Message length less than 5 bytes:
+            0|1|
+            0|0
+    
+    (c) Message type code not four characters or not recognized:
+            0|09|HELO|joe|
+            0|08|BYE|joe| 
+
+    (d) Number of bytes received doesn't match the stated amount:   
+            0|03|OPEN|joe|
+    
+    (e) Not properly terminated:
+            0|08|OPEN|joe
+    For all of the cases above, the server correctly responds with 0|16|FAIL|10 Invalid| and disconnects the client connection.
